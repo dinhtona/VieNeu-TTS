@@ -915,3 +915,224 @@ def babble_log_line(best, tries: int, cap: int) -> str:
     what = f"chunk {best[1]} tiếng: {best[2]} cụm âm" if best[1] else "cue đứng một mình"
     return (f"babble guard: {what}, {best[3]}/{cap} frame sau {tries} lần sinh lại"
             + (" — vẫn nghi ngờ" if best[0] else ""))
+
+
+# ─── Guard HỐ IM LẶNG trong một chunk (10/2026) ──────────────────────────────
+# Lỗi đo được trên chính máy này (arc 0641-0650, 0961-0970, 0981-0990, 1011-1020):
+# model lặng ra một đoạn im lặng CỨNG giữa chunk — đo bằng volumedetect là
+# −76…−84 dB trong khi thoại quanh đó là −5…−6 dB — dài 2–15 s, rồi đọc tiếp
+# ĐÚNG chữ (ASR đối chiếu: không mất chữ, tức là im lặng THỪA).
+#
+# Vì sao lọt: (1) app chỉ chèn khoảng nghỉ GIỮA các đoạn tối đa 0.70 s
+# (``V3_GAP_SILENCE``) nên mọi hố > 0.7 s đều nằm TRONG một lần sinh, hoặc do
+# im lặng đuôi chunk trước CỘNG im lặng đầu chunk sau (``join_audio_chunks``
+# chỉ chèn thêm zeros cho đủ ngưỡng, không bao giờ cắt bớt); (2) không đâu
+# trong repo kiểm NĂNG LƯỢNG của đoạn vừa sinh — chỉ có sàn thời lượng
+# (``MIN_FRAMES_PER_PHONE``, đường CUDA) và babble guard (chunk ≤ 3 tiếng).
+#
+# Cách chặn (ngay trong ``infer`` một chunk, cùng tầng với babble guard nên mọi
+# lối vào đều được che): quét lại waveform VỪA SINH, hố quá trần thì sinh lại
+# (best-of-N như babble), rồi CẮT bớt phần im lặng dư. Cắt im lặng cứng là mất
+# mát bằng 0: trong đoạn đó không có mẫu nào mang tiếng, nên không thể mất chữ.
+GAP_THRESH_DB = -50.0        # dưới mức này coi là im lặng (hố thật đo được −76…−84 dB)
+GAP_WIN_S = 0.010            # cửa sổ đo envelope mean|x|
+GAP_MAX_INTERNAL_S = 1.5     # hố BÊN TRONG chunk dài hơn mức này là lỗi
+GAP_KEEP_INTERNAL_S = 0.7    # cắt hố còn 0.7 s (ngang khoảng nghỉ hết đoạn)
+GAP_MAX_EDGE_S = 0.8         # im lặng model tự sinh ở MÉP chunk
+GAP_KEEP_EDGE_S = 0.4        # cắt mép còn 0.4 s (nhịp tự nhiên model vẫn giữ nguyên)
+GAP_MAX_RETRIES = 2          # số lần sinh lại tối đa cho một chunk có hố
+_GAP_SETTINGS: Optional[dict] = None
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def gap_guard_settings() -> dict:
+    """Cấu hình guard hố im lặng (đọc env MỘT lần cho cả tiến trình).
+
+    ``VIENEU_GAP_GUARD=0`` tắt hẳn. Các trần/khoảng-giữ- lại đổi được bằng
+    ``VIENEU_GAP_MAX_S`` / ``VIENEU_GAP_KEEP_S`` / ``VIENEU_GAP_MAX_EDGE_S`` /
+    ``VIENEU_GAP_KEEP_EDGE_S`` / ``VIENEU_GAP_RETRIES`` / ``VIENEU_GAP_THRESH_DB``.
+    """
+    global _GAP_SETTINGS
+    if _GAP_SETTINGS is None:
+        _GAP_SETTINGS = {
+            "enabled": env_bool("VIENEU_GAP_GUARD", True),
+            "thresh_db": _env_float("VIENEU_GAP_THRESH_DB", GAP_THRESH_DB),
+            "max_internal_s": _env_float("VIENEU_GAP_MAX_S", GAP_MAX_INTERNAL_S),
+            "keep_internal_s": _env_float("VIENEU_GAP_KEEP_S", GAP_KEEP_INTERNAL_S),
+            "max_edge_s": _env_float("VIENEU_GAP_MAX_EDGE_S", GAP_MAX_EDGE_S),
+            "keep_edge_s": _env_float("VIENEU_GAP_KEEP_EDGE_S", GAP_KEEP_EDGE_S),
+            "retries": max(0, int(_env_float("VIENEU_GAP_RETRIES", GAP_MAX_RETRIES))),
+        }
+    return _GAP_SETTINGS
+
+
+def silence_runs(
+    wav: np.ndarray, sr: int, thresh_db: float = GAP_THRESH_DB, win_s: float = GAP_WIN_S
+) -> List[Tuple[int, int]]:
+    """Các đoạn im lặng ``[start, end)`` (theo mẫu) trong ``wav`` mono.
+
+    Envelope ``mean|x|`` theo cửa sổ ``win_s`` (cửa sổ cuối ôm luôn phần dư), dưới
+    ``thresh_db`` là im lặng. Trả cả đoạn ở hai mép (mép là đoạn chạm mẫu 0 / cuối).
+    """
+    x = np.asarray(wav, dtype=np.float32).reshape(-1)
+    n = int(x.size)
+    win = max(1, int(win_s * sr))
+    if n == 0 or n < win:
+        return []
+    bounds = list(range(0, n, win))
+    env = np.array([np.abs(x[b: b + win]).mean() for b in bounds], dtype=np.float32)
+    silent = env <= 10.0 ** (thresh_db / 20.0)
+    runs: List[Tuple[int, int]] = []
+    start: Optional[int] = None
+    for i, is_silent in enumerate(silent):
+        if is_silent and start is None:
+            start = i
+        elif not is_silent and start is not None:
+            runs.append((bounds[start], min(n, bounds[i])))
+            start = None
+    if start is not None:
+        runs.append((bounds[start], n))
+    return runs
+
+
+def gap_suspect(
+    wav: np.ndarray, sr: int, *, thresh_db: Optional[float] = None,
+    max_internal_s: Optional[float] = None, max_edge_s: Optional[float] = None,
+) -> Tuple[float, float, float, int]:
+    """Đo hố im lặng của MỘT chunk vừa sinh -> ``(excess_s, internal_max_s, edge_max_s, n_runs)``.
+
+    ``excess_s`` = tổng số giây VƯỢT trần (0 nghĩa là chunk sạch). Chunk câm toàn
+    phần (im lặng suốt) KHÔNG tính là hố ở đây — nó là lỗi kiểu khác, đã có sàn
+    thời lượng lo; và cắt nó đi thì chẳng còn gì để đọc.
+    """
+    cfg = gap_guard_settings()
+    thresh_db = cfg["thresh_db"] if thresh_db is None else thresh_db
+    max_internal_s = cfg["max_internal_s"] if max_internal_s is None else max_internal_s
+    max_edge_s = cfg["max_edge_s"] if max_edge_s is None else max_edge_s
+    x = np.asarray(wav, dtype=np.float32).reshape(-1)
+    runs = silence_runs(x, sr, thresh_db=thresh_db)
+    if not runs or (len(runs) == 1 and runs[0] == (0, int(x.size))):
+        return 0.0, 0.0, 0.0, 0
+    internal_max = edge_max = excess = 0.0
+    for i, (a, b) in enumerate(runs):
+        run_s = (b - a) / sr
+        is_edge = (a == 0 and i == 0) or (b == int(x.size) and i == len(runs) - 1)
+        if is_edge:
+            edge_max = max(edge_max, run_s)
+            excess += max(0.0, run_s - max_edge_s)
+        else:
+            internal_max = max(internal_max, run_s)
+            excess += max(0.0, run_s - max_internal_s)
+    return excess, internal_max, edge_max, len(runs)
+
+
+def gap_prefer(new, old) -> bool:
+    """Bản sinh lại ``new`` có đáng thay ``old`` không (tuple từ :func:`gap_suspect`)."""
+    (n_exc, n_int, n_edge, _), (o_exc, o_int, o_edge, _) = new, old
+    if not math.isclose(n_exc, o_exc, abs_tol=0.05):
+        return n_exc < o_exc
+    return (n_int, n_edge) < (o_int, o_edge)
+
+
+def cap_silence_gaps(
+    wav: np.ndarray, sr: int, *, thresh_db: Optional[float] = None,
+    max_internal_s: Optional[float] = None, keep_internal_s: Optional[float] = None,
+    max_edge_s: Optional[float] = None, keep_edge_s: Optional[float] = None,
+    edges: str = "chunk",
+) -> Tuple[np.ndarray, dict]:
+    """Cắt mọi đoạn im lặng dài hơn trần về ``keep`` -> ``(wav_mới, thống kê)``.
+
+    ``edges="chunk"`` (mặc định): đoạn im lặng chạm mép waveform là mép CHUNK, dùng
+    trần mép riêng. ``edges="none"``: coi mọi đoạn như đoạn trong — dùng khi chạy
+    trên CẢ file arc, lúc đó mép file không phải mép chunk. Wav toàn im lặng trả nguyên.
+    """
+    cfg = gap_guard_settings()
+    thresh_db = cfg["thresh_db"] if thresh_db is None else thresh_db
+    max_internal_s = cfg["max_internal_s"] if max_internal_s is None else max_internal_s
+    keep_internal_s = cfg["keep_internal_s"] if keep_internal_s is None else keep_internal_s
+    if edges == "none":
+        edge_limits = (None, keep_internal_s)      # coi mép như đoạn trong
+    else:
+        max_edge_s = cfg["max_edge_s"] if max_edge_s is None else max_edge_s
+        keep_edge_s = cfg["keep_edge_s"] if keep_edge_s is None else keep_edge_s
+        edge_limits = (max_edge_s, keep_edge_s)
+    x = np.asarray(wav, dtype=np.float32).reshape(-1)
+    stats: dict = {"trimmed": [], "excess_s": 0.0, "internal_max_s": 0.0, "edge_max_s": 0.0}
+    n = int(x.size)
+    if n == 0:
+        return x, stats
+    runs = silence_runs(x, sr, thresh_db=thresh_db)
+    if not runs:
+        return x, stats
+    if len(runs) == 1 and runs[0] == (0, n):
+        stats["all_silent"] = True
+        return x, stats
+    ranges: List[Tuple[int, int]] = []
+    cursor = 0
+    for i, (a, b) in enumerate(runs):
+        run_s = (b - a) / sr
+        is_edge = (a == 0 and i == 0) or (b == n and i == len(runs) - 1)
+        if is_edge and edge_limits[0] is not None:
+            kind, limit, keep_s = "lead" if a == 0 else "tail", edge_limits[0], edge_limits[1]
+            stats["edge_max_s"] = max(stats["edge_max_s"], run_s)
+        else:
+            kind, limit, keep_s = "internal", max_internal_s, keep_internal_s
+            stats["internal_max_s"] = max(stats["internal_max_s"], run_s)
+        if run_s <= limit:
+            continue
+        keep_n = max(0, int(round(keep_s * sr)))
+        if kind == "lead":
+            na, nb = max(a, b - keep_n), b            # giữ phần sát tiếng
+        elif kind == "tail":
+            na, nb = a, min(b, a + keep_n)            # giữ phần sát tiếng
+        else:
+            na = a + max(0, (b - a - keep_n) // 2)    # giữ khúc GIỮA hố
+            nb = min(b, na + keep_n)
+        stats["excess_s"] += (b - a - (nb - na)) / sr
+        stats["trimmed"].append({
+            "pos_s": round(a / sr, 2), "was_s": round(run_s, 2),
+            "kept_s": round((nb - na) / sr, 2), "kind": kind,
+        })
+        # Giữ (cursor..a) = phần có tiếng trước hố, (na..nb) = khúc im lặng giữ lại;
+        # hai khúc (a..na) và (nb..b) của hố bị bỏ nên con trỏ nhảy thẳng tới b.
+        ranges.append((cursor, a))
+        ranges.append((na, nb))
+        cursor = b
+    if not stats["trimmed"]:
+        return x, stats
+    if cursor < n:
+        ranges.append((cursor, n))
+    out = np.concatenate([x[a:b] for a, b in ranges if b > a]) if len(ranges) > 1 else x
+    return np.ascontiguousarray(out, dtype=np.float32), stats
+
+
+def gap_log_line(best, tries: int, stats: dict) -> str:
+    """Một dòng log cho guard hố im lặng."""
+    parts = [f"{t['kind']} {t['was_s']}s→{t['kept_s']}s @{t['pos_s']}s" for t in stats.get("trimmed", [])]
+    return (f"gap guard: hố dài nhất trong chunk {best[1]:.2f}s, mép {best[2]:.2f}s"
+            + (f", sinh lại {tries} lần" if tries else "")
+            + (f", cắt {stats.get('excess_s', 0.0):.2f}s [{'; '.join(parts)}]" if parts else "")
+            + (" — ĐÃ SẠCH" if not parts else ""))
+
+
+def gap_guard_note(payload: dict, path: Optional[str] = None) -> None:
+    """Ghi một dòng JSON vào sổ sự kiện guard hố (mặc định ``~/.vieneu_gap_guard.log``).
+
+    Server Gradio không ghi log ra file nên đây là bằng chứng duy nhất còn lại sau
+    khi chạy; luôn best-effort, không bao giờ làm chết lượt sinh.
+    """
+    try:
+        import json
+        import time as _time
+        p = path or os.environ.get("VIENEU_GAP_LOG") or "~/.vieneu_gap_guard.log"
+        rec = {"ts": _time.strftime("%Y-%m-%dT%H:%M:%S"), **payload}
+        with open(os.path.expanduser(p), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 — chỉ là sổ tay, không được chặn sinh audio
+        pass

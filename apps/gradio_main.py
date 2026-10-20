@@ -1862,7 +1862,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                 # Default parameters based on backbone
                 if "v3" in default_backbone.lower():
                     default_codec = "VieNeu-Codec"
-                    default_temp = 0.8
+                    default_temp = 0.5
                     default_text = DEFAULT_TEXT_V3
                 elif "Turbo" in default_backbone:
                     default_codec = "VieNeu-Codec"
@@ -2432,17 +2432,17 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
 
         # --- Auto-adjust Temperature on Tab Switch ---
         conv_tab.select(
-            fn=lambda bb: gr.update(value=0.8 if "v3" in (bb or "").lower() else 1.0),
+            fn=lambda bb: gr.update(value=0.5 if "v3" in (bb or "").lower() else 1.0),
             inputs=backbone_select,
             outputs=temperature_slider
         )
         single_tab.select(
-            fn=lambda bb: gr.update(value=0.8 if "v3" in (bb or "").lower() else default_temp),
+            fn=lambda bb: gr.update(value=0.5 if "v3" in (bb or "").lower() else default_temp),
             inputs=backbone_select,
             outputs=temperature_slider
         )
         tab_custom.select(
-            fn=lambda bb: gr.update(value=0.8 if "v3" in (bb or "").lower() else default_temp),
+            fn=lambda bb: gr.update(value=0.5 if "v3" in (bb or "").lower() else default_temp),
             inputs=backbone_select,
             outputs=temperature_slider
         )

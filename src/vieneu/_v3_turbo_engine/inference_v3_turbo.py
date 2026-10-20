@@ -32,7 +32,9 @@ from .hub_load_v3_turbo import load_v3_turbo_checkpoint
 from .modeling_v3_turbo import VieNeuV3TurboForTTS, _sample_token
 from .rep_history import DEFAULT_REP_WINDOW, RepetitionHistory
 from vieneu_utils.core_utils import (BABBLE_MAX_RETRIES, CODEC_SAMPLES_PER_FRAME, babble_suspect,
-                                     babble_prefer, babble_log_line)
+                                     babble_prefer, babble_log_line,
+                                     gap_guard_settings, gap_suspect, gap_prefer,
+                                     gap_log_line, gap_guard_note, cap_silence_gaps)
 import logging
 
 # Reference clips longer than this are trimmed before enrollment.
@@ -197,6 +199,37 @@ class VieNeuTTSv3Turbo:
                 tries += 1
             if tries:
                 logging.getLogger("Vieneu.V3Turbo").info("🔁 " + babble_log_line(best, tries, max_new_frames))
+        # Gap guard: hố im lặng CỨNG giữa chunk (xem vieneu_utils.core_utils).
+        # App chỉ chèn khoảng nghỉ ≤ 0.70 s giữa các đoạn, nên hố dài hơn mức đó
+        # hoặc nằm TRONG một lần sinh, hoặc do im lặng đuôi chunk này cộng im lặng
+        # đầu chunk sau. Không đâu trong repo kiểm năng lượng của đoạn vừa sinh nên
+        # hố lọt thẳng vào file main. Ở đây: hố quá trần -> sinh lại (best-of-N như
+        # babble), rồi CẮT bớt phần im lặng dư (cắt im lặng cứng không mất chữ).
+        gcfg = gap_guard_settings()
+        if gcfg["enabled"]:
+            g_sr = int(getattr(self, "sample_rate", 48_000))
+            g_best = gap_suspect(wav, g_sr)
+            g_tries = 0
+            while g_best[0] > 0 and g_tries < gcfg["retries"]:
+                c2 = gen()
+                w2 = self._decode_codes(c2)
+                cand = gap_suspect(w2, g_sr)
+                if gap_prefer(cand, g_best):
+                    codes, wav, g_best = c2, w2, cand
+                g_tries += 1
+            chunks_s = float(np.asarray(wav).size) / g_sr
+            wav, g_stats = cap_silence_gaps(wav, g_sr)
+            if g_stats.get("trimmed") or g_tries:
+                logging.getLogger("Vieneu.V3Turbo").info("🕳 " + gap_log_line(g_best, g_tries, g_stats))
+                gap_guard_note({
+                    "phonemes": (phonemes or "")[:80],
+                    "chunk_s": round(chunks_s, 2),
+                    "retries": g_tries,
+                    "hole_max_before_s": round(g_best[1], 2),
+                    "edge_max_before_s": round(g_best[2], 2),
+                    "trimmed_s": round(float(g_stats.get("excess_s", 0.0)), 2),
+                    "trimmed": g_stats.get("trimmed", []),
+                })
         return wav
 
     def infer_stream(self, phonemes: Optional[str]=None, text: Optional[str]=None, ref_codes: Optional[np.ndarray]=None, speaker_emb: Optional[np.ndarray]=None, style=None, use_ref_codes: bool=True, temperature: float=0.8, top_k: int=25, top_p: float=0.95, max_new_frames: int=300, chunk_frames: int=25, repetition_penalty: float=1.2, repetition_window: int=DEFAULT_REP_WINDOW, frame_cap: bool=True) -> Generator[np.ndarray, None, None]:

@@ -34,7 +34,9 @@ from typing import Generator, List, Optional, Tuple, Union
 import numpy as np
 
 from .rep_history import DEFAULT_REP_WINDOW, RepetitionHistory
-from vieneu_utils.core_utils import (BABBLE_MAX_RETRIES, babble_suspect, babble_prefer, babble_log_line, CODEC_SAMPLES_PER_FRAME, pad_to_codec_frame)
+from vieneu_utils.core_utils import (BABBLE_MAX_RETRIES, babble_suspect, babble_prefer, babble_log_line, CODEC_SAMPLES_PER_FRAME, pad_to_codec_frame,
+                                     gap_guard_settings, gap_suspect, gap_prefer,
+                                     gap_log_line, gap_guard_note, cap_silence_gaps)
 import logging
 
 _V3_REPO = "pnnbao-ump/VieNeu-TTS-v3-Turbo"
@@ -451,6 +453,37 @@ class OnnxV3LiteEngine:
                     frames, wav, best = f2, w2, cand
             if tries:
                 logging.getLogger("Vieneu.V3Turbo.ONNX").info("🔁 " + babble_log_line(best, tries, max_new_frames))
+        # Gap guard: hố im lặng CỨNG giữa chunk (xem vieneu_utils.core_utils).
+        # Đây là ENGINE THẬT trên Mac (backend auto + CPU -> ONNX): nhúng chỉ vào
+        # inference_v3_turbo.py là không bao giờ chạy (phát hiện 08/10).
+        gcfg = gap_guard_settings()
+        if gcfg["enabled"]:
+            g_sr = int(getattr(self, "sample_rate", 48_000))
+            g_best = gap_suspect(wav, g_sr)
+            g_tries = 0
+            while g_best[0] > 0 and g_tries < gcfg["retries"]:
+                f2 = _gen_once()
+                if not f2:
+                    break
+                w2 = self._decode_codes(np.stack(f2))
+                cand = gap_suspect(w2, g_sr)
+                if gap_prefer(cand, g_best):
+                    frames, wav, g_best = f2, w2, cand
+                g_tries += 1
+            chunks_s = float(np.asarray(wav).size) / g_sr
+            wav, g_stats = cap_silence_gaps(wav, g_sr)
+            if g_stats.get("trimmed") or g_tries:
+                logging.getLogger("Vieneu.V3Turbo.ONNX").info("🕳 " + gap_log_line(g_best, g_tries, g_stats))
+                gap_guard_note({
+                    "engine": "onnx",
+                    "phonemes": (phonemes or "")[:80],
+                    "chunk_s": round(chunks_s, 2),
+                    "retries": g_tries,
+                    "hole_max_before_s": round(g_best[1], 2),
+                    "edge_max_before_s": round(g_best[2], 2),
+                    "trimmed_s": round(float(g_stats.get("excess_s", 0.0)), 2),
+                    "trimmed": g_stats.get("trimmed", []),
+                })
         return wav
 
     # ── streaming synthesis (native, frame-level) ──────────────────────────────
